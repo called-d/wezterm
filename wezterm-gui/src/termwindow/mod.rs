@@ -1033,12 +1033,8 @@ impl TermWindow {
                     Some(pane) => pane,
                     None => return Ok(true),
                 };
-                let urls = urls
-                    .iter()
-                    .map(|url| self.config.quote_dropped_files.escape(&url.to_string()))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    + " ";
+                let urls = urls.iter().map(|url| url.to_string()).collect();
+                let urls = self.format_dropped_items(&pane, urls);
                 pane.send_paste(urls.as_str())?;
                 Ok(true)
             }
@@ -1049,14 +1045,9 @@ impl TermWindow {
                 };
                 let paths = paths
                     .iter()
-                    .map(|path| {
-                        self.config
-                            .quote_dropped_files
-                            .escape(&path.to_string_lossy())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    + " ";
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect();
+                let paths = self.format_dropped_items(&pane, paths);
                 pane.send_paste(&paths)?;
                 Ok(true)
             }
@@ -1908,6 +1899,46 @@ impl TermWindow {
         };
 
         return window_id == self.mux_window_id;
+    }
+
+    /// Builds the text to paste for dropped files or urls.
+    /// The `dropped-files` event may return the text itself (for example to
+    /// translate Windows paths for a WSL pane); if it returns nil, each item
+    /// is quoted according to `quote_dropped_files` and joined with spaces.
+    fn format_dropped_items(&mut self, pane: &Arc<dyn Pane>, items: Vec<String>) -> String {
+        let window = GuiWin::new(self);
+        let mux_pane = MuxPane(pane.pane_id());
+        let text = match config::run_immediate_with_lua_config(|lua| {
+            if let Some(lua) = lua {
+                let v = config::lua::emit_sync_callback(
+                    &*lua,
+                    (
+                        "dropped-files".to_string(),
+                        (window, mux_pane, items.clone()),
+                    ),
+                )?;
+                match &v {
+                    mlua::Value::Nil => Ok(None),
+                    _ => Ok(Some(String::from_lua(v, &*lua)?)),
+                }
+            } else {
+                Ok(None)
+            }
+        }) {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!("dropped-files: {}", err);
+                None
+            }
+        };
+        text.unwrap_or_else(|| {
+            items
+                .iter()
+                .map(|item| self.config.quote_dropped_files.escape(item))
+                .collect::<Vec<_>>()
+                .join(" ")
+                + " "
+        })
     }
 
     fn emit_user_var_event(&mut self, pane_id: PaneId, name: String, value: String) {
