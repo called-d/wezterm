@@ -2054,6 +2054,13 @@ impl ImmContext {
         }
     }
 
+    /// Turn the IME on or off.
+    pub fn set_open(&self, open: bool) {
+        unsafe {
+            ImmSetOpenStatus(self.imc, open as BOOL);
+        }
+    }
+
     pub fn get_str(&self, which: DWORD) -> Result<String, OsString> {
         // This returns a size in bytes even though it is for a buffer of u16!
         let byte_size =
@@ -2544,6 +2551,27 @@ unsafe fn key(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<L
         inner.dead_pending,
     );
 
+    // Henkan/Muhenkan don't turn the IME on or off by themselves here:
+    // depending on the IME state they arrive either as VK_PROCESSKEY or as
+    // VK_CONVERT/VK_NONCONVERT, and in neither case does the IME act on them.
+    // Do it ourselves, keyed by scan code: Henkan turns the IME on and
+    // Muhenkan turns it off, unless there is a composition in progress, in
+    // which case the IME gets the key as usual (to convert, katakana, ...).
+    const SCAN_HENKAN: u8 = 0x79;
+    const SCAN_MUHENKAN: u8 = 0x7b;
+    if msg == WM_KEYDOWN && (scan_code == SCAN_HENKAN || scan_code == SCAN_MUHENKAN) {
+        let composing = ImmContext::get(hwnd)
+            .get_str(GCS_COMPSTR)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        log::trace!("henkan/muhenkan scan={} composing={}", scan_code, composing);
+        if !composing {
+            drop(inner);
+            ImmContext::get(hwnd).set_open(scan_code == SCAN_HENKAN);
+            return Some(0);
+        }
+    }
+
     if ime_active {
         // If the IME is active, allow Windows to perform default processing
         // to drive it forwards.  It will generate a call to `ime_composition`
@@ -2561,6 +2589,11 @@ unsafe fn key(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<L
         }
 
         return None;
+    }
+
+    // The rest of Henkan/Muhenkan (key up) has nothing to send to the pane.
+    if wparam == VK_CONVERT as WPARAM || wparam == VK_NONCONVERT as WPARAM {
+        return Some(0);
     }
 
     if msg == WM_DEADCHAR {
