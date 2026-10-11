@@ -7350,6 +7350,7 @@ dependencies = [
  "num-traits",
  "ordered-float 4.6.0",
  "serde",
+ "serde_json",
  "terminfo",
  "termwiz",
  "unicode-normalization",

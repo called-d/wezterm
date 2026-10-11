@@ -32,9 +32,11 @@ mod keyboard;
 mod kitty;
 mod mouse;
 pub(crate) mod performer;
+mod program_status;
 mod sixel;
 use crate::terminalstate::image::*;
 use crate::terminalstate::kitty::*;
+use crate::terminalstate::program_status::*;
 
 lazy_static::lazy_static! {
     static ref DB: Database = {
@@ -350,6 +352,8 @@ pub struct TerminalState {
     /// The icon title string (OSC 1)
     icon_title: Option<String>,
     progress: Progress,
+    /// OSC 7501 records
+    program_status: ProgramStatusTable,
 
     palette: Option<ColorPalette>,
 
@@ -595,6 +599,7 @@ impl TerminalState {
             bidi_enabled: None,
             bidi_hint: None,
             progress: Progress::default(),
+            program_status: ProgramStatusTable::default(),
         }
     }
 
@@ -1083,6 +1088,24 @@ impl TerminalState {
 
     pub fn user_vars(&self) -> &HashMap<String, String> {
         &self.user_vars
+    }
+
+    /// Publish the OSC 7501 records through their user var
+    fn program_status_did_change(&mut self) {
+        let value = self.program_status.to_json();
+        match self.user_vars.get(PROGRAM_STATUS_USER_VAR) {
+            Some(current) if *current == value => return,
+            None if value == "[]" => return,
+            _ => {}
+        }
+        self.user_vars
+            .insert(PROGRAM_STATUS_USER_VAR.to_string(), value.clone());
+        if let Some(handler) = self.alert_handler.as_mut() {
+            handler.alert(Alert::SetUserVar {
+                name: PROGRAM_STATUS_USER_VAR.to_string(),
+                value,
+            });
+        }
     }
 
     fn clear_semantic_attribute_due_to_movement(&mut self) {
