@@ -1548,6 +1548,40 @@ unsafe fn wm_enter_exit_size_move(
     Some(0)
 }
 
+/// We declare PerMonitorV2 awareness in the manifest, so the system won't
+/// resize the window when it moves to a monitor with a different dpi: that's
+/// on us. Without this, the dpi change alone reaches the gui layer, which
+/// resizes the window to keep the rows/cols with SWP_NOMOVE (anchored at the
+/// top left). Mid-drag that can shift the window back across the monitor
+/// boundary, flipping the dpi back, and the window oscillates in size.
+/// The suggested rect accounts for that and keeps the window under the cursor.
+unsafe fn wm_dpichanged(
+    hwnd: HWND,
+    _msg: UINT,
+    _wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    let rect = &*(lparam as *const RECT);
+    log::trace!(
+        "WM_DPICHANGED dpi={} suggested={}x{}+{}+{}",
+        GetDpiForWindow(hwnd),
+        rect_width(rect),
+        rect_height(rect),
+        rect.left,
+        rect.top
+    );
+    SetWindowPos(
+        hwnd,
+        null_mut(),
+        rect.left,
+        rect.top,
+        rect_width(rect),
+        rect_height(rect),
+        SWP_NOACTIVATE | SWP_NOZORDER,
+    );
+    Some(0)
+}
+
 /// We handle WM_WINDOWPOSCHANGED and dispatch directly to our wm_size as it
 /// is a bit more efficient than letting DefWindowProcW parse this and
 /// trigger WM_SIZE.
@@ -2953,6 +2987,7 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         WM_PAINT => wm_paint(hwnd, msg, wparam, lparam),
         WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE => wm_enter_exit_size_move(hwnd, msg, wparam, lparam),
         WM_WINDOWPOSCHANGED => wm_windowposchanged(hwnd, msg, wparam, lparam),
+        WM_DPICHANGED => wm_dpichanged(hwnd, msg, wparam, lparam),
         WM_SETFOCUS => wm_set_focus(hwnd, msg, wparam, lparam),
         WM_KILLFOCUS => wm_kill_focus(hwnd, msg, wparam, lparam),
         WM_DEADCHAR | WM_KEYDOWN | WM_KEYUP | WM_SYSCHAR | WM_CHAR | WM_IME_CHAR | WM_SYSKEYUP
