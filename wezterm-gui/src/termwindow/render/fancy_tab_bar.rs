@@ -597,12 +597,28 @@ fn translate_dragged_tab(
 
 /// Each element is rendered into the layer for its own zindex, so raising
 /// only the tab itself would paint its background over its own title.
-/// Raise the whole subtree; within a layer the background is drawn first.
+/// Shift the whole subtree so that its topmost element lands on i8::MAX,
+/// keeping the relative order between the title and the close button.
 fn raise_zindex(computed: &mut ComputedElement) {
-    computed.zindex = i8::MAX;
+    let delta = i8::MAX.saturating_sub(max_zindex(computed));
+    shift_zindex(computed, delta);
+}
+
+fn max_zindex(computed: &ComputedElement) -> i8 {
+    let mut max = computed.zindex;
+    if let ComputedElementContent::Children(kids) = &computed.content {
+        for kid in kids {
+            max = max.max(max_zindex(kid));
+        }
+    }
+    max
+}
+
+fn shift_zindex(computed: &mut ComputedElement, delta: i8) {
+    computed.zindex = computed.zindex.saturating_add(delta);
     if let ComputedElementContent::Children(kids) = &mut computed.content {
         for kid in kids {
-            raise_zindex(kid);
+            shift_zindex(kid, delta);
         }
     }
 }
