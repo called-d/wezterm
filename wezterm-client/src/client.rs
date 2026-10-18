@@ -434,6 +434,74 @@ async fn client_thread_async(
     }
 }
 
+/// Connect the stdio pipes of a proxy command to `sock`, the child's end of
+/// the socketpair: bytes the client writes to the other end go to the
+/// child's stdin, and the child's stdout goes back. When either side closes,
+/// the other is closed too, so the client sees EOF if the proxy exits.
+#[cfg(windows)]
+fn relay_proxy_stdio(
+    child: &mut std::process::Child,
+    sock: filedescriptor::FileDescriptor,
+) -> anyhow::Result<()> {
+    use std::net::Shutdown;
+    use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+
+    // The socket is in synchronous mode, where a blocking read on a handle
+    // also holds up a write on it from another thread, so drive it through
+    // async-io (non-blocking) from both threads.
+    let sock = std::sync::Arc::new(Async::new(unsafe {
+        TcpStream::from_raw_socket(sock.into_raw_socket())
+    })?);
+    let mut to_child = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("proxy command has no stdin pipe"))?;
+    let mut from_child = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("proxy command has no stdout pipe"))?;
+
+    let from_client_sock = std::sync::Arc::clone(&sock);
+    thread::Builder::new()
+        .name("proxy-stdin".to_string())
+        .spawn(move || {
+            block_on(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match smol::io::AsyncReadExt::read(&mut &*from_client_sock, &mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if to_child.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            // Dropping `to_child` closes the child's stdin.
+        })?;
+    thread::Builder::new()
+        .name("proxy-stdout".to_string())
+        .spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match from_child.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let sent =
+                            block_on(smol::io::AsyncWriteExt::write_all(&mut &*sock, &buf[..n]));
+                        if sent.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            // Wakes the read in proxy-stdin and gives the client its EOF.
+            let _ = sock.get_ref().shutdown(Shutdown::Both);
+        })?;
+    Ok(())
+}
+
 pub fn unix_connect_with_retry(
     target: &UnixTarget,
     just_spawned: bool,
@@ -465,12 +533,26 @@ pub fn unix_connect_with_retry(
 
                 let (a, b) = filedescriptor::socketpair()?;
 
-                cmd.stdin(b.as_stdio()?);
-                cmd.stdout(b.as_stdio()?);
+                // On Windows the socketpair is a pair of loopback TCP sockets.
+                // Console programs such as wsl.exe cannot use a socket
+                // handle as stdio, so give the child pipes and relay them
+                // to the socket instead.
+                #[cfg(unix)]
+                {
+                    cmd.stdin(b.as_stdio()?);
+                    cmd.stdout(b.as_stdio()?);
+                }
+                #[cfg(windows)]
+                {
+                    cmd.stdin(std::process::Stdio::piped());
+                    cmd.stdout(std::process::Stdio::piped());
+                }
                 cmd.stderr(std::process::Stdio::inherit());
                 let mut child = cmd
                     .spawn()
                     .with_context(|| format!("spawning proxy command {:?}", cmd))?;
+                #[cfg(windows)]
+                relay_proxy_stdio(&mut child, b)?;
 
                 error.take();
 
