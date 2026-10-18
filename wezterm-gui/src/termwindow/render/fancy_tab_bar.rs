@@ -581,7 +581,7 @@ fn translate_dragged_tab(
     if is_target {
         let delta_x = target_x - computed.bounds.min_x();
         computed.translate(euclid::Vector2D::new(delta_x, 0.0));
-        computed.zindex = i8::MAX;
+        raise_zindex(computed);
         return true;
     }
 
@@ -593,6 +593,18 @@ fn translate_dragged_tab(
         }
     }
     false
+}
+
+/// Each element is rendered into the layer for its own zindex, so raising
+/// only the tab itself would paint its background over its own title.
+/// Raise the whole subtree; within a layer the background is drawn first.
+fn raise_zindex(computed: &mut ComputedElement) {
+    computed.zindex = i8::MAX;
+    if let ComputedElementContent::Children(kids) = &mut computed.content {
+        for kid in kids {
+            raise_zindex(kid);
+        }
+    }
 }
 
 fn make_x_button(
