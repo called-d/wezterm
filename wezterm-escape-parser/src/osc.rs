@@ -52,6 +52,7 @@ pub enum OperatingSystemCommand {
     ResetColors(Vec<u8>),
     RxvtExtension(Vec<String>),
     ConEmuProgress(Progress),
+    ProgramStatus(ProgramStatus),
 
     Unspecified(Vec<Vec<u8>>),
 }
@@ -363,6 +364,9 @@ impl OperatingSystemCommand {
             }
             FinalTermSemanticPrompt => self::FinalTermSemanticPrompt::parse(osc)
                 .map(OperatingSystemCommand::FinalTermSemanticPrompt),
+            ProgramStatus => {
+                self::ProgramStatus::parse(osc).map(OperatingSystemCommand::ProgramStatus)
+            }
             ChangeColorNumber => Self::parse_change_color_number(osc),
             ResetColors => Self::parse_reset_colors(osc),
 
@@ -499,6 +503,9 @@ osc_entries!(
     RxvtProprietary = "777",
     FinalTermSemanticPrompt = "133",
     ITermProprietary = "1337",
+    /// Program Status Protocol
+    /// <https://www.superlogical.com/rex/docs/build/program-status>
+    ProgramStatus = "7501",
     /// Here the "Sun" suffix comes from the table in
     /// <https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Miscellaneous>
     /// that lays out various window related escape sequences.
@@ -612,6 +619,7 @@ impl Display for OperatingSystemCommand {
             ConEmuProgress(Progress::SetError(pct)) => write!(f, "9;4;2;{pct}")?,
             ConEmuProgress(Progress::SetIndeterminate) => write!(f, "9;4;3")?,
             ConEmuProgress(Progress::Paused) => write!(f, "9;4;4")?,
+            ProgramStatus(status) => status.fmt(f)?,
         };
         // Use the longer form ST as neovim doesn't like the BEL version
         write!(f, "\x1b\\")?;
@@ -1380,6 +1388,293 @@ impl Display for ITermProprietary {
     }
 }
 
+/// OSC 7501: Program Status Protocol.
+/// A program reports what it is doing (idle, working, blocked, ...) as
+/// a set of records, optionally arranged in a hierarchy by `id`.
+/// <https://www.superlogical.com/rex/docs/build/program-status>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgramStatus {
+    /// `OSC 7501 ; ? ST`: feature detection
+    Query,
+    Report(ProgramStatusReport),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramStatusState {
+    Idle,
+    Working,
+    Done,
+    Blocked,
+    Error,
+    /// Removes the addressed record and its descendants
+    Clear,
+}
+
+impl ProgramStatusState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+            Self::Error => "error",
+            Self::Clear => "clear",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "idle" => Self::Idle,
+            "working" => Self::Working,
+            "done" => Self::Done,
+            "blocked" => Self::Blocked,
+            "error" => Self::Error,
+            "clear" => Self::Clear,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramStatusKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+impl ProgramStatusKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::Question => "question",
+            Self::Auth => "auth",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "permission" => Self::Permission,
+            "question" => Self::Question,
+            "auth" => Self::Auth,
+            _ => return None,
+        })
+    }
+}
+
+/// A validated report.  `title` and `msg` hold the decoded text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramStatusReport {
+    pub state: ProgramStatusState,
+    /// `None` addresses the root record
+    pub id: Option<String>,
+    pub kind: Option<ProgramStatusKind>,
+    pub progress: Option<u8>,
+    pub app: Option<String>,
+    pub title: Option<String>,
+    pub msg: Option<String>,
+}
+
+impl ProgramStatusReport {
+    pub fn new(state: ProgramStatusState) -> Self {
+        Self {
+            state,
+            id: None,
+            kind: None,
+            progress: None,
+            app: None,
+            title: None,
+            msg: None,
+        }
+    }
+}
+
+impl ProgramStatus {
+    /// The reply to `Query`, listing what we support
+    pub const QUERY_REPLY: &'static str =
+        "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\";
+
+    const MAX_SEQUENCE_LEN: usize = 4096;
+    const MAX_KEY_LEN: usize = 16;
+    const MAX_ID_LEN: usize = 128;
+    const MAX_ID_DEPTH: usize = 8;
+    const MAX_NAME_LEN: usize = 32;
+    const MAX_TITLE_ENCODED: usize = 256;
+    const MAX_TITLE_DECODED: usize = 192;
+    const MAX_MSG_ENCODED: usize = 2732;
+    const MAX_MSG_DECODED: usize = 2048;
+
+    fn is_value_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b"_.,+/=-".contains(&b)
+    }
+
+    /// `[A-Za-z0-9_.+-]{1,32}`: an id segment or an app name
+    fn is_name(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= Self::MAX_NAME_LEN
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.+-".contains(&b))
+    }
+
+    fn is_id(s: &str) -> bool {
+        s.len() <= Self::MAX_ID_LEN
+            && s.split('/').count() <= Self::MAX_ID_DEPTH
+            && s.split('/').all(Self::is_name)
+    }
+
+    /// Characters that can disguise the text without being control
+    /// characters: bidi overrides/isolates/marks and zero width ones.
+    fn is_invisible_formatting(c: char) -> bool {
+        matches!(c,
+            '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}')
+    }
+
+    fn decode_text(encoded: &str, max_encoded: usize, max_decoded: usize) -> Result<String> {
+        use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+        ensure!(encoded.len() <= max_encoded, "encoded text too long");
+        let bytes = GeneralPurpose::new(
+            &base64::alphabet::STANDARD,
+            GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+        )
+        .decode(encoded)
+        .map_err(|err| format_err!("base64: {:#}", err))?;
+        ensure!(bytes.len() <= max_decoded, "decoded text too long");
+        let text = String::from_utf8(bytes)?;
+        ensure!(
+            !text.chars().any(char::is_control),
+            "control character in text"
+        );
+        Ok(text
+            .chars()
+            .filter(|&c| !Self::is_invisible_formatting(c))
+            .collect())
+    }
+
+    fn parse(osc: &[&[u8]]) -> Result<Self> {
+        // ESC ] ... ESC \ plus the `;` separators
+        let len = 4 + osc.iter().map(|p| p.len()).sum::<usize>() + osc.len() - 1;
+        ensure!(len <= Self::MAX_SEQUENCE_LEN, "sequence too long");
+        ensure!(osc.len() >= 2, "no body");
+
+        // `;` is outside the value set, so a body that the parser split
+        // on `;` is put back together and the affected pairs get skipped.
+        let body = osc[1..]
+            .iter()
+            .map(|p| String::from_utf8_lossy(p))
+            .collect::<Vec<_>>()
+            .join(";");
+        if body == "?" {
+            return Ok(Self::Query);
+        }
+
+        let mut state = None;
+        let mut id = None;
+        let mut kind = None;
+        let mut progress = None;
+        let mut app = None;
+        let mut title = None;
+        let mut msg = None;
+
+        for pair in body.split(':') {
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if key.is_empty()
+                || key.len() > Self::MAX_KEY_LEN
+                || !key.bytes().all(|b| b.is_ascii_lowercase())
+                || !value.bytes().all(Self::is_value_byte)
+            {
+                continue;
+            }
+            // the last value wins; unknown keys are ignored
+            let slot = match key {
+                "state" => &mut state,
+                "id" => &mut id,
+                "kind" => &mut kind,
+                "progress" => &mut progress,
+                "app" => &mut app,
+                "title" => &mut title,
+                "msg" => &mut msg,
+                _ => continue,
+            };
+            *slot = Some(value);
+        }
+
+        let state = state.ok_or_else(|| format_err!("missing state"))?;
+        let state =
+            ProgramStatusState::from_str(state).ok_or_else(|| format_err!("unknown state"))?;
+        let mut report = ProgramStatusReport::new(state);
+
+        if let Some(id) = id {
+            ensure!(Self::is_id(id), "invalid id");
+            report.id = Some(id.to_string());
+        }
+        if state == ProgramStatusState::Blocked {
+            report.kind = kind.and_then(ProgramStatusKind::from_str);
+        }
+        if matches!(
+            state,
+            ProgramStatusState::Working | ProgramStatusState::Blocked
+        ) {
+            report.progress = progress
+                .filter(|p| !p.is_empty() && p.len() <= 3 && p.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|p| p.parse::<u8>().ok())
+                .filter(|&p| p <= 100);
+        }
+        report.app = app.filter(|a| Self::is_name(a)).map(str::to_string);
+        if let Some(title) = title {
+            report.title = Some(Self::decode_text(
+                title,
+                Self::MAX_TITLE_ENCODED,
+                Self::MAX_TITLE_DECODED,
+            )?);
+        }
+        if let Some(msg) = msg {
+            report.msg = Some(Self::decode_text(
+                msg,
+                Self::MAX_MSG_ENCODED,
+                Self::MAX_MSG_DECODED,
+            )?);
+        }
+
+        Ok(Self::Report(report))
+    }
+}
+
+impl Display for ProgramStatus {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        write!(f, "7501;")?;
+        let report = match self {
+            Self::Query => return write!(f, "?"),
+            Self::Report(report) => report,
+        };
+        write!(f, "state={}", report.state.as_str())?;
+        if let Some(id) = &report.id {
+            write!(f, ":id={id}")?;
+        }
+        if let Some(kind) = report.kind {
+            write!(f, ":kind={}", kind.as_str())?;
+        }
+        if let Some(progress) = report.progress {
+            write!(f, ":progress={progress}")?;
+        }
+        if let Some(app) = &report.app {
+            write!(f, ":app={app}")?;
+        }
+        if let Some(title) = &report.title {
+            write!(f, ":title={}", base64_encode(title))?;
+        }
+        if let Some(msg) = &report.msg {
+            write!(f, ":msg={}", base64_encode(msg))?;
+        }
+        Ok(())
+    }
+}
+
 fn not_nan_err(err: ordered_float::FloatIsNan) -> crate::Error {
     format_err!("{:#}", err)
 }
@@ -2018,6 +2313,87 @@ mod test {
                     data: b"hello".to_vec(),
                 }
             )))
+        );
+    }
+
+    fn program_status(body: &str) -> OperatingSystemCommand {
+        OperatingSystemCommand::parse(&[b"7501", body.as_bytes()])
+    }
+
+    fn report(body: &str) -> ProgramStatusReport {
+        match program_status(body) {
+            OperatingSystemCommand::ProgramStatus(ProgramStatus::Report(r)) => r,
+            other => panic!("expected a report for {body:?}, got {other:?}"),
+        }
+    }
+
+    fn rejected(body: &str) -> bool {
+        matches!(program_status(body), OperatingSystemCommand::Unspecified(_))
+    }
+
+    #[test]
+    fn program_status_query() {
+        assert_eq!(
+            program_status("?"),
+            OperatingSystemCommand::ProgramStatus(ProgramStatus::Query)
+        );
+        assert_eq!(encode(&program_status("?")), "\x1b]7501;?\x1b\\");
+    }
+
+    #[test]
+    fn program_status_report() {
+        // "hello" and "deploying" with and without padding
+        let r = report(
+            "state=blocked:id=deploy/eu-west:kind=permission:progress=40:app=rex:title=aGVsbG8=:msg=ZGVwbG95aW5n:future=1",
+        );
+        assert_eq!(r.state, ProgramStatusState::Blocked);
+        assert_eq!(r.id.as_deref(), Some("deploy/eu-west"));
+        assert_eq!(r.kind, Some(ProgramStatusKind::Permission));
+        assert_eq!(r.progress, Some(40));
+        assert_eq!(r.app.as_deref(), Some("rex"));
+        assert_eq!(r.title.as_deref(), Some("hello"));
+        assert_eq!(r.msg.as_deref(), Some("deploying"));
+        assert_eq!(
+            encode(&program_status("state=working:progress=7:app=cargo")),
+            "\x1b]7501;state=working:progress=7:app=cargo\x1b\\"
+        );
+    }
+
+    #[test]
+    fn program_status_lenient_fields() {
+        // malformed pairs are skipped, the last value wins
+        let r = report("bogus:=x:Key=v:state=error:state=idle:app=a;b");
+        assert_eq!(r.state, ProgramStatusState::Idle);
+        assert_eq!(r.app, None);
+        // kind only with blocked, progress only with working/blocked
+        let r = report("state=done:kind=permission:progress=50");
+        assert_eq!((r.kind, r.progress), (None, None));
+        // out of range or non-numeric progress is absent
+        assert_eq!(report("state=working:progress=101").progress, None);
+        assert_eq!(report("state=working:progress=+5").progress, None);
+        // unknown kind is absent
+        assert_eq!(report("state=blocked:kind=coffee").kind, None);
+    }
+
+    #[test]
+    fn program_status_rejected() {
+        assert!(rejected("app=x"));
+        assert!(rejected("state=sleeping"));
+        assert!(rejected("state=idle:id=a//b"));
+        assert!(rejected("state=idle:id=a/b/c/d/e/f/g/h/i"));
+        // "a\nb" is a control character
+        assert!(rejected("state=idle:msg=YQpi"));
+        assert!(rejected("state=idle:msg=A"));
+        let long = format!("state=idle:msg={}", "A".repeat(4096));
+        assert!(rejected(&long));
+    }
+
+    #[test]
+    fn program_status_strips_invisible_formatting() {
+        // "a" U+202E "b"
+        assert_eq!(
+            report("state=idle:title=YeKArmI").title.as_deref(),
+            Some("ab")
         );
     }
 }

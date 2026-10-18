@@ -1,5 +1,6 @@
 use crate::terminal::{Alert, Progress};
 use crate::terminalstate::kitty::KITTY_UNICODE_PLACEHOLDER;
+use crate::terminalstate::program_status::PROGRAM_STATUS_USER_VAR;
 use crate::terminalstate::{
     default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
 };
@@ -23,7 +24,7 @@ use wezterm_escape_parser::csi::{
 };
 use wezterm_escape_parser::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
-    ITermUnicodeVersionOp, Selection,
+    ITermUnicodeVersionOp, ProgramStatus, Selection,
 };
 use wezterm_escape_parser::{
     Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
@@ -727,6 +728,8 @@ impl<'a> Performer<'a> {
                 self.suppress_initial_title_change = false;
                 self.accumulating_title.take();
                 self.progress = Progress::default();
+                self.program_status.reset();
+                self.program_status_did_change();
 
                 self.screen.full_reset();
                 self.screen.activate_alt_screen(seqno);
@@ -837,6 +840,9 @@ impl<'a> Performer<'a> {
                     self.writer.flush().ok();
                 }
                 ITermProprietary::File(image) => self.set_image(*image),
+                ITermProprietary::SetUserVar { name, .. } if name == PROGRAM_STATUS_USER_VAR => {
+                    log::warn!("ignoring SetUserVar for the reserved {name}");
+                }
                 ITermProprietary::SetUserVar { name, value } => {
                     self.user_vars.insert(name.clone(), value.clone());
                     if let Some(handler) = self.alert_handler.as_mut() {
@@ -879,6 +885,8 @@ impl<'a> Performer<'a> {
             ) => {
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                self.program_status.prompt_started();
+                self.program_status_did_change();
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::StartPrompt(_),
@@ -1085,6 +1093,14 @@ impl<'a> Performer<'a> {
                 }
                 self.implicit_palette_reset_if_same_as_configured();
                 self.palette_did_change();
+            }
+            OperatingSystemCommand::ProgramStatus(ProgramStatus::Query) => {
+                write!(self.writer, "{}", ProgramStatus::QUERY_REPLY).ok();
+                self.writer.flush().ok();
+            }
+            OperatingSystemCommand::ProgramStatus(ProgramStatus::Report(report)) => {
+                self.program_status.apply(report);
+                self.program_status_did_change();
             }
             OperatingSystemCommand::ConEmuProgress(prog) => {
                 use wezterm_escape_parser::osc::Progress as TProg;
