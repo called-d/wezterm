@@ -1616,17 +1616,33 @@ unsafe fn wm_size(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> O
     None
 }
 
+fn dispatch_focus_changed(hwnd: HWND, focused: bool) -> Option<LRESULT> {
+    let inner = rc_from_hwnd(hwnd)?;
+    match inner.try_borrow_mut() {
+        Ok(mut inner) => inner.events.dispatch(WindowEvent::FocusChanged(focused)),
+        Err(_) => {
+            // The IME can pump messages from inside a call that we make
+            // while holding the borrow (eg: ImmSetCandidateWindow), so the
+            // focus change has to wait until the borrow is released.
+            // Other focus messages may be handled before then, so report
+            // whatever the focus is at that point rather than `focused`.
+            Connection::with_window_inner(HWindow(hwnd), |inner| {
+                let focused = unsafe { GetFocus() } == inner.hwnd.0;
+                inner.events.dispatch(WindowEvent::FocusChanged(focused));
+                Ok(())
+            });
+        }
+    }
+    None
+}
+
 unsafe fn wm_set_focus(
     hwnd: HWND,
     _msg: UINT,
     _wparam: WPARAM,
     _lparam: LPARAM,
 ) -> Option<LRESULT> {
-    rc_from_hwnd(hwnd)?
-        .borrow_mut()
-        .events
-        .dispatch(WindowEvent::FocusChanged(true));
-    None
+    dispatch_focus_changed(hwnd, true)
 }
 
 unsafe fn wm_kill_focus(
@@ -1635,11 +1651,7 @@ unsafe fn wm_kill_focus(
     _wparam: WPARAM,
     _lparam: LPARAM,
 ) -> Option<LRESULT> {
-    rc_from_hwnd(hwnd)?
-        .borrow_mut()
-        .events
-        .dispatch(WindowEvent::FocusChanged(false));
-    None
+    dispatch_focus_changed(hwnd, false)
 }
 
 unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
